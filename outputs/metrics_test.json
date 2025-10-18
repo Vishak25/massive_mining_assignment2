@@ -1,0 +1,13 @@
+{
+  "best_model": "logistic_regression",
+  "metrics": {
+    "PR_AUC": 0.9265230216314879,
+    "ROC_AUC": 0.9773113272693457,
+    "balanced_accuracy": 0.8915238548062094,
+    "MCC": 0.7982543568248232,
+    "TP": 31298,
+    "FP": 5142,
+    "TN": 148873,
+    "FN": 7037
+  }
+}

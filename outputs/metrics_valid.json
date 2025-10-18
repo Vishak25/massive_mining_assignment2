@@ -1,0 +1,23 @@
+{
+  "logistic_regression": {
+    "PR_AUC": 0.925999415758418,
+    "ROC_AUC": 0.977000967744351,
+    "balanced_accuracy": 0.8898682348531173,
+    "MCC": 0.7961324505333338,
+    "fit_time_s": 7.51
+  },
+  "random_forest": {
+    "PR_AUC": 0.7790210082272593,
+    "ROC_AUC": 0.9188842643161531,
+    "balanced_accuracy": 0.6053492696213246,
+    "MCC": 0.40787469823275235,
+    "fit_time_s": 22.37
+  },
+  "logistic_regression_weighted": {
+    "PR_AUC": 0.9233330796778593,
+    "ROC_AUC": 0.9769413364571901,
+    "balanced_accuracy": 0.9190787342621975,
+    "MCC": 0.7696968856800116,
+    "fit_time_s": 5.9
+  }
+}

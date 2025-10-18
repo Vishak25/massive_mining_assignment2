@@ -1,0 +1,23 @@
+{
+  "train": {
+    "rows": 300750,
+    "positive": 60448,
+    "negative": 240302,
+    "positive_fraction": 0.2009908561928512,
+    "negative_fraction": 0.7990091438071488
+  },
+  "valid": {
+    "rows": 192076,
+    "positive": 38463,
+    "negative": 153613,
+    "positive_fraction": 0.20024885982631874,
+    "negative_fraction": 0.7997511401736812
+  },
+  "test": {
+    "rows": 192350,
+    "positive": 38335,
+    "negative": 154015,
+    "positive_fraction": 0.1992981544060307,
+    "negative_fraction": 0.8007018455939693
+  }
+}
