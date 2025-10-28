@@ -1,13 +1,23 @@
 """
 CS-657 Assignment 2 – Imbalanced Classification on Molecular SA
-Laptop-friendly PySpark pipeline that:
-  * loads MOSES fingerprint batches from the fixed local directory,
-  * relabels using the 80th percentile SA_score threshold (target80),
-  * performs an 80/10/10 random split,
-  * trains three models (LR, RF, class-weighted LR),
-  * reports validation metrics, selects the best by PR-AUC,
-  * evaluates the best model on the test split,
-  * writes metrics, split stats, and calibration data to outputs/.
+Comprehensive PySpark pipeline that:
+  * Loads MOSES fingerprint batches from the local directory
+  * Relabels using the 80th percentile SA_score threshold (target80)
+  * Performs an 80/10/10 random split
+  * Implements THREE imbalance handling strategies:
+    - Class weighting (native PySpark weightCol)
+    - Random undersampling (majority class)
+    - Random oversampling (minority class)
+  * Trains FIVE models: LR, RF, LR-weighted, LR-undersampled, LR-oversampled
+  * Reports comprehensive metrics: PR-AUC, ROC-AUC, Precision, Recall, F1, 
+    Balanced Accuracy, MCC
+  * Selects best model by validation PR-AUC
+  * Evaluates best model on test split with confusion matrix
+  * Generates visualizations: PR curve and calibration curve (PNG)
+  * Performs scaling experiments (100k, 500k, 1M rows)
+  * Exports metrics in both JSON and CSV formats
+  * Writes comprehensive ~5 page report with intro, methods, results, discussion
+  * All outputs saved to outputs/ directory
 """
 
 import csv
@@ -16,6 +26,11 @@ import math
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend for server environments
+import matplotlib.pyplot as plt
+import numpy as np
 
 from pyspark import StorageLevel
 from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
@@ -108,16 +123,29 @@ def confusion_and_stats(pred_df: DataFrame) -> Dict[str, float]:
     ).collect()[0]
     tp, fp, tn, fn = (int(agg["TP"]), int(agg["FP"]), int(agg["TN"]), int(agg["FN"]))
     eps = 1e-12
-    tpr = tp / (tp + fn) if (tp + fn) else 0.0
+    
+    # Precision, Recall, F1
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) else 0.0
+    
+    # TPR, TNR, Balanced Accuracy
+    tpr = recall  # TPR is the same as recall
     tnr = tn / (tn + fp) if (tn + fp) else 0.0
     bal_acc = 0.5 * (tpr + tnr)
+    
+    # MCC
     denom = math.sqrt(max((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn), eps))
     mcc = ((tp * tn) - (fp * fn)) / denom if denom else 0.0
+    
     return {
         "TP": tp,
         "FP": fp,
         "TN": tn,
         "FN": fn,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
         "balanced_accuracy": bal_acc,
         "MCC": mcc,
     }
@@ -141,11 +169,15 @@ def evaluate_model(model, train_df: DataFrame, valid_df: DataFrame, name: str) -
     metrics = {
         "PR_AUC": pr_auc,
         "ROC_AUC": roc_auc,
+        "precision": conf["precision"],
+        "recall": conf["recall"],
+        "f1": conf["f1"],
         "balanced_accuracy": conf["balanced_accuracy"],
         "MCC": conf["MCC"],
         "fit_time_s": round(fit_time, 2),
     }
     print(f"{name} (VALID): PR-AUC={pr_auc:.4f} | ROC-AUC={roc_auc:.4f} | "
+          f"Prec={conf['precision']:.4f} | Rec={conf['recall']:.4f} | F1={conf['f1']:.4f} | "
           f"BalAcc={conf['balanced_accuracy']:.4f} | MCC={conf['MCC']:.4f} | "
           f"train_time_s={metrics['fit_time_s']}")
     return fitted, metrics
@@ -166,6 +198,9 @@ def evaluate_on_split(model, df: DataFrame, split_name: str) -> Tuple[Dict[str, 
     metrics = {
         "PR_AUC": pr_auc,
         "ROC_AUC": roc_auc,
+        "precision": conf["precision"],
+        "recall": conf["recall"],
+        "f1": conf["f1"],
         "balanced_accuracy": conf["balanced_accuracy"],
         "MCC": conf["MCC"],
         "TP": conf["TP"],
@@ -174,6 +209,7 @@ def evaluate_on_split(model, df: DataFrame, split_name: str) -> Tuple[Dict[str, 
         "FN": conf["FN"],
     }
     print(f"{split_name} metrics: PR-AUC={pr_auc:.4f} | ROC-AUC={roc_auc:.4f} | "
+          f"Prec={conf['precision']:.4f} | Rec={conf['recall']:.4f} | F1={conf['f1']:.4f} | "
           f"BalAcc={conf['balanced_accuracy']:.4f} | MCC={conf['MCC']:.4f} "
           f"| TP={conf['TP']} FP={conf['FP']} TN={conf['TN']} FN={conf['FN']}")
     return metrics, preds
@@ -234,7 +270,121 @@ def human_model_name(key: str) -> str:
         "logistic_regression": "Logistic Regression",
         "random_forest": "Random Forest",
         "logistic_regression_weighted": "Logistic Regression (class-weighted)",
+        "logistic_regression_undersampled": "Logistic Regression (undersampled)",
+        "logistic_regression_oversampled": "Logistic Regression (oversampled)",
     }.get(key, key)
+
+
+def undersample_majority(df: DataFrame, seed: int = SEED) -> DataFrame:
+    """Random undersampling: downsample majority class to match minority count."""
+    counts = collect_class_balance(df)
+    n_pos = counts.get(1, 0)
+    n_neg = counts.get(0, 0)
+    if n_pos >= n_neg:
+        return df  # minority is already smaller or equal
+    
+    # Undersample majority (class 0)
+    df_pos = df.filter(F.col(TARGET_COL) == 1)
+    df_neg = df.filter(F.col(TARGET_COL) == 0)
+    fraction = n_pos / n_neg
+    df_neg_sampled = df_neg.sample(withReplacement=False, fraction=fraction, seed=seed)
+    return df_pos.union(df_neg_sampled)
+
+
+def oversample_minority(df: DataFrame, seed: int = SEED) -> DataFrame:
+    """Random oversampling: upsample minority class to match majority count."""
+    counts = collect_class_balance(df)
+    n_pos = counts.get(1, 0)
+    n_neg = counts.get(0, 0)
+    if n_pos >= n_neg:
+        return df  # minority is already larger or equal
+    
+    # Oversample minority (class 1)
+    df_pos = df.filter(F.col(TARGET_COL) == 1)
+    df_neg = df.filter(F.col(TARGET_COL) == 0)
+    ratio = n_neg / n_pos
+    # Sample with replacement at ratio to match majority
+    df_pos_sampled = df_pos.sample(withReplacement=True, fraction=ratio, seed=seed)
+    return df_neg.union(df_pos_sampled)
+
+
+def plot_pr_curve(preds: DataFrame, output_path: Path) -> None:
+    """Generate and save PR curve visualization."""
+    # Collect predictions and labels
+    data = preds.select(TARGET_COL, "p1").collect()
+    y_true = np.array([row[TARGET_COL] for row in data])
+    y_scores = np.array([row["p1"] for row in data])
+    
+    # Sort by score descending
+    sorted_indices = np.argsort(-y_scores)
+    y_true_sorted = y_true[sorted_indices]
+    
+    # Calculate precision and recall at each threshold
+    precisions = []
+    recalls = []
+    
+    total_pos = np.sum(y_true)
+    for i in range(len(y_true_sorted)):
+        tp = np.sum(y_true_sorted[:i+1])
+        fp = (i + 1) - tp
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / total_pos if total_pos > 0 else 0.0
+        precisions.append(precision)
+        recalls.append(recall)
+    
+    # Plot
+    plt.figure(figsize=(8, 6))
+    plt.plot(recalls, precisions, linewidth=2, color='blue')
+    plt.xlabel('Recall', fontsize=12)
+    plt.ylabel('Precision', fontsize=12)
+    plt.title('Precision-Recall Curve (Validation)', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.xlim([0, 1])
+    plt.ylim([0, 1])
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"PR curve saved to {output_path}")
+
+
+def plot_calibration_curve(calib_rows: List[Dict[str, float]], output_path: Path) -> None:
+    """Generate and save calibration curve visualization."""
+    mean_preds = [row['mean_pred'] for row in calib_rows if row['count'] > 0]
+    emp_rates = [row['empirical_pos_rate'] for row in calib_rows if row['count'] > 0]
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Perfect Calibration')
+    plt.plot(mean_preds, emp_rates, 'o-', linewidth=2, markersize=8, color='red', label='Model Calibration')
+    plt.xlabel('Mean Predicted Probability', fontsize=12)
+    plt.ylabel('Empirical Positive Rate', fontsize=12)
+    plt.title('Calibration Curve (Validation)', fontsize=14)
+    plt.legend(loc='best', fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.xlim([0, 1])
+    plt.ylim([0, 1])
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"Calibration curve saved to {output_path}")
+
+
+def write_metrics_csv(path: Path, metrics_dict: Dict[str, Dict[str, float]]) -> None:
+    """Write metrics dictionary to CSV format."""
+    if not metrics_dict:
+        return
+    
+    # Get all metric names from the first model
+    first_model = list(metrics_dict.values())[0]
+    fieldnames = ["model"] + list(first_model.keys())
+    
+    with path.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for model_name, metrics in metrics_dict.items():
+            row = {"model": model_name}
+            row.update(metrics)
+            writer.writerow(row)
+    print(f"Metrics CSV saved to {path}")
 
 
 def write_report(path: Path,
@@ -244,7 +394,8 @@ def write_report(path: Path,
                  best_model_key: str,
                  test_metrics: Dict[str, float],
                  calibration_rows: List[Dict[str, float]],
-                 pos_weight: float) -> None:
+                 pos_weight: float,
+                 scaling_results: List[Dict[str, float]] = None) -> None:
     lines: List[str] = []
     lines.append("# CS-657 Assignment 2 – Imbalanced Molecular SA Classifier\n")
 
@@ -300,6 +451,9 @@ def write_report(path: Path,
 
     path.write_text("".join(lines), encoding="utf-8")
 
+
+# Import comprehensive report generator
+from report_generator import write_comprehensive_report
 
 # ----------------------------------------------------------------------
 # Main pipeline executes immediately when this script is run via spark-submit
@@ -389,10 +543,26 @@ train_weighted = train_df.withColumn(
 lr_w_fitted, lr_w_metrics = evaluate_model(lr_weighted_model, train_weighted, valid_df,
                                            "Logistic Regression (class-weighted)")
 
+# Undersampling and oversampling strategies
+print("\nTraining models with imbalance handling:")
+train_undersampled = undersample_majority(train_df)
+train_undersampled = train_undersampled.persist(StorageLevel.MEMORY_AND_DISK)
+summarize_split("TRAIN (undersampled)", train_undersampled)
+lr_us_fitted, lr_us_metrics = evaluate_model(lr_model, train_undersampled, valid_df,
+                                              "Logistic Regression (undersampled)")
+
+train_oversampled = oversample_minority(train_df)
+train_oversampled = train_oversampled.persist(StorageLevel.MEMORY_AND_DISK)
+summarize_split("TRAIN (oversampled)", train_oversampled)
+lr_os_fitted, lr_os_metrics = evaluate_model(lr_model, train_oversampled, valid_df,
+                                              "Logistic Regression (oversampled)")
+
 valid_metrics = {
     "logistic_regression": lr_metrics,
     "random_forest": rf_metrics,
     "logistic_regression_weighted": lr_w_metrics,
+    "logistic_regression_undersampled": lr_us_metrics,
+    "logistic_regression_oversampled": lr_os_metrics,
 }
 
 best_name, best_fitted = max(
@@ -400,19 +570,66 @@ best_name, best_fitted = max(
         ("logistic_regression", lr_fitted, lr_metrics),
         ("random_forest", rf_fitted, rf_metrics),
         ("logistic_regression_weighted", lr_w_fitted, lr_w_metrics),
+        ("logistic_regression_undersampled", lr_us_fitted, lr_us_metrics),
+        ("logistic_regression_oversampled", lr_os_fitted, lr_os_metrics),
     ],
     key=lambda item: item[2]["PR_AUC"]
 )[:2]
-print(f"Best model by VALID PR-AUC: {best_name}")
+print(f"\nBest model by VALID PR-AUC: {best_name}")
 
 test_metrics, _ = evaluate_on_split(best_fitted, test_df, "TEST")
 
 _, valid_preds = evaluate_on_split(best_fitted, valid_df, "VALID (best)")
 calib_rows = calibration_table(valid_preds, CALIBRATION_BINS)
-print("Calibration (VALID) bins:")
+print("\nCalibration (VALID) bins:")
 for row in calib_rows:
     print(f"  {row['bin']}: mean_pred={row['mean_pred']:.4f}, "
           f"empirical_pos_rate={row['empirical_pos_rate']:.4f}, count={row['count']}")
+
+# Generate visualizations
+print("\nGenerating visualizations...")
+plot_pr_curve(valid_preds, OUTPUT_DIR / "pr_curve_valid.png")
+plot_calibration_curve(calib_rows, OUTPUT_DIR / "calibration_curve_valid.png")
+
+# Scaling experiment
+print("\nRunning scaling experiments...")
+scaling_results = []
+for size in [100_000, 500_000, 1_000_000]:
+    if train_count < size:
+        print(f"Skipping size {size:,} (only {train_count:,} training samples available)")
+        continue
+    
+    print(f"\nScaling experiment with {size:,} training samples...")
+    fraction = size / float(train_count)
+    train_sample = train_df.sample(withReplacement=False, fraction=fraction, seed=SEED)
+    train_sample_weighted = train_sample.withColumn(
+        "weight",
+        F.when(F.col(TARGET_COL) == 1, F.lit(pos_weight)).otherwise(F.lit(1.0))
+    )
+    train_sample_weighted = train_sample_weighted.persist(StorageLevel.MEMORY_AND_DISK)
+    actual_size = train_sample_weighted.count()
+    
+    start_time = time.time()
+    lr_scale_model = LogisticRegression(featuresCol="features", labelCol=TARGET_COL,
+                                        weightCol="weight", maxIter=50)
+    lr_scale_fitted = lr_scale_model.fit(train_sample_weighted)
+    train_time = time.time() - start_time
+    
+    preds_scale = lr_scale_fitted.transform(valid_df).select(TARGET_COL, "rawPrediction")
+    pr_eval_scale = BinaryClassificationEvaluator(rawPredictionCol="rawPrediction",
+                                                   labelCol=TARGET_COL,
+                                                   metricName="areaUnderPR")
+    pr_auc_scale = pr_eval_scale.evaluate(preds_scale)
+    
+    result = {
+        "train_rows": actual_size,
+        "train_time_s": round(train_time, 2),
+        "pr_auc": round(pr_auc_scale, 4),
+    }
+    scaling_results.append(result)
+    print(f"  Size={actual_size:,}, Time={train_time:.2f}s, PR-AUC={pr_auc_scale:.4f}")
+    
+    train_sample_weighted.unpersist()
 
 # Persist outputs
 overall_balance = {
@@ -425,21 +642,52 @@ overall_balance = {
     "q80": q80,
 }
 
+print("\nWriting outputs...")
 write_json(OUTPUT_DIR / "metrics_valid.json", valid_metrics)
 write_json(OUTPUT_DIR / "metrics_test.json", {"best_model": best_name, "metrics": test_metrics})
 write_json(OUTPUT_DIR / "class_balance_overall.json", overall_balance)
 write_json(OUTPUT_DIR / "class_balance_by_split.json", split_stats)
+
+# CSV exports
+write_metrics_csv(OUTPUT_DIR / "metrics_valid.csv", valid_metrics)
+test_metrics_for_csv = {best_name: test_metrics}
+write_metrics_csv(OUTPUT_DIR / "metrics_test.csv", test_metrics_for_csv)
+
 write_split_stats(OUTPUT_DIR / "split_stats.txt", split_stats)
 write_calibration_csv(OUTPUT_DIR / "calibration_valid.csv", calib_rows)
-write_report(Path("REPORT.md"), overall_balance, split_stats, valid_metrics,
-             best_name, test_metrics, calib_rows, pos_weight)
 
-print("Artifacts written to outputs/:")
-for path in ["metrics_valid.json", "metrics_test.json", "class_balance_overall.json",
-             "class_balance_by_split.json", "split_stats.txt", "calibration_valid.csv"]:
+# Scaling results
+if scaling_results:
+    write_json(OUTPUT_DIR / "scaling_results.json", scaling_results)
+    with (OUTPUT_DIR / "scaling_results.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["train_rows", "train_time_s", "pr_auc"])
+        writer.writeheader()
+        for row in scaling_results:
+            writer.writerow(row)
+    print(f"Scaling results saved to {OUTPUT_DIR / 'scaling_results.csv'}")
+
+# Generate comprehensive report
+write_comprehensive_report(Path("REPORT.md"), overall_balance, split_stats, valid_metrics,
+                           best_name, test_metrics, calib_rows, pos_weight, scaling_results)
+print("Comprehensive report written to REPORT.md")
+
+print("\nAll artifacts written to outputs/:")
+artifact_list = [
+    "metrics_valid.json", "metrics_valid.csv",
+    "metrics_test.json", "metrics_test.csv",
+    "class_balance_overall.json", "class_balance_by_split.json",
+    "split_stats.txt", "calibration_valid.csv",
+    "pr_curve_valid.png", "calibration_curve_valid.png"
+]
+if scaling_results:
+    artifact_list.extend(["scaling_results.json", "scaling_results.csv"])
+for path in artifact_list:
     print(f"  - {OUTPUT_DIR / path}")
 
 train_df.unpersist()
 valid_df.unpersist()
 test_df.unpersist()
+train_undersampled.unpersist()
+train_oversampled.unpersist()
+print("\nPipeline complete!")
 spark.stop()
