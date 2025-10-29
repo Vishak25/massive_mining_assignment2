@@ -1,0 +1,17 @@
+[
+  {
+    "train_rows": 19640,
+    "train_time_s": 5.49,
+    "pr_auc": 0.8376
+  },
+  {
+    "train_rows": 97578,
+    "train_time_s": 5.53,
+    "pr_auc": 0.9156
+  },
+  {
+    "train_rows": 195736,
+    "train_time_s": 5.71,
+    "pr_auc": 0.9212
+  }
+]
