@@ -1141,19 +1141,6 @@ if scaling_results:
         OUTPUT_DIR / "scaling_train_time.png",
     )
 
-# Generate comprehensive report
-write_comprehensive_report(
-    Path("REPORT.md"),
-    overall_balance,
-    split_stats,
-    valid_metrics,
-    best_name,
-    test_metrics,
-    calib_rows,
-    pos_weight,
-    scaling_results,
-)
-print("Comprehensive report written to REPORT.md")
 
 
 print("\nAll artifacts written to outputs/:")
