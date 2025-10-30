@@ -1,23 +1,23 @@
 {
   "train": {
-    "rows": 300750,
-    "positive": 60448,
-    "negative": 240302,
-    "positive_fraction": 0.2009908561928512,
-    "negative_fraction": 0.7990091438071488
+    "rows": 300682,
+    "positive": 62244,
+    "negative": 238438,
+    "positive_fraction": 0.20700939863377255,
+    "negative_fraction": 0.7929906013662275
   },
   "valid": {
-    "rows": 192076,
-    "positive": 38463,
-    "negative": 153613,
-    "positive_fraction": 0.20024885982631874,
-    "negative_fraction": 0.7997511401736812
+    "rows": 187591,
+    "positive": 38213,
+    "negative": 149378,
+    "positive_fraction": 0.2037038024212249,
+    "negative_fraction": 0.7962961975787751
   },
   "test": {
-    "rows": 192350,
-    "positive": 38335,
-    "negative": 154015,
-    "positive_fraction": 0.1992981544060307,
-    "negative_fraction": 0.8007018455939693
+    "rows": 187109,
+    "positive": 36299,
+    "negative": 150810,
+    "positive_fraction": 0.19399921970616057,
+    "negative_fraction": 0.8060007802938394
   }
 }

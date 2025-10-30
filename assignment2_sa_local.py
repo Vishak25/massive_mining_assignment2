@@ -2,19 +2,20 @@
 CS-657 Assignment 2 – Imbalanced Classification on Molecular SA
 Comprehensive PySpark pipeline that:
   * Loads MOSES fingerprint batches from the local directory
-  * Relabels using the 80th percentile SA_score threshold (target80)
-  * Performs an 80/10/10 random split
+  * Creates binary labels from SA_score quantiles (top 20% = hard, bottom 80% = easy)
+  * Performs an 80/10/10 scaffold-aware split (Bemis–Murcko)
   * Implements THREE imbalance handling strategies:
     - Class weighting (native PySpark weightCol)
     - Random undersampling (majority class)
     - Random oversampling (minority class)
-  * Trains FIVE models: LR, RF, LR-weighted, LR-undersampled, LR-oversampled
-  * Reports comprehensive metrics: PR-AUC, ROC-AUC, Precision, Recall, F1, 
+  * Trains SIX models: LR, RF, LR-weighted, RF-weighted, LR-undersampled,
+    LR-oversampled, RF-undersampled, RF-oversampled
+  * Reports comprehensive metrics: PR-AUC, ROC-AUC, Precision, Recall, F1,
     Balanced Accuracy, MCC
   * Selects best model by validation PR-AUC
   * Evaluates best model on test split with confusion matrix
-  * Generates visualizations: PR curve and calibration curve (PNG)
-  * Performs scaling experiments (100k, 500k, 1M rows)
+  * Generates comprehensive visualizations: PR curves, ROC curves, calibration curves,
+    and imbalance method comparisons (PNG)
   * Exports metrics in both JSON and CSV formats
   * Writes comprehensive ~5 page report with intro, methods, results, discussion
   * All outputs saved to outputs/ directory
@@ -38,19 +39,27 @@ from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.functions import vector_to_array
 from pyspark.ml.linalg import VectorUDT, Vectors
-from pyspark.sql import DataFrame, SparkSession, functions as F
+from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
+
+# Optional RDKit for scaffold-aware splitting
+try:
+    from rdkit import Chem
+    from rdkit.Chem.Scaffolds import MurckoScaffold
+    _RDKIT_AVAILABLE = True
+except Exception:
+    _RDKIT_AVAILABLE = False
 
 # ----------------------------------------------------------------------
 # Configuration (fixed per assignment brief)
 # ----------------------------------------------------------------------
-DATA_DIR = "/Users/vishaknandakumar/Documents/Masters/College/Fall25/CS-657/Assignment2/moses_molecule_batches_sa"
+DATA_DIR = "./moses_molecule_batches_sa"
 BATCH_GLOB = str(Path(DATA_DIR) / "moses_fp_batch_*.csv.gz")
 OUTPUT_DIR = Path("outputs")
 SEED = 42
 CALIBRATION_BINS = 10
 SMILES_COL = "SMILES"
 SA_SCORE_COL = "SA_score"
-TARGET_COL = "target80"
+TARGET_COL = "SA_label"
 MAX_TRAIN_ROWS = 300_000  # keep runtime manageable on a laptop
 
 
@@ -151,21 +160,142 @@ def confusion_and_stats(pred_df: DataFrame) -> Dict[str, float]:
     }
 
 
-def evaluate_model(model, train_df: DataFrame, valid_df: DataFrame, name: str) -> Tuple[object, Dict[str, float]]:
+def _best_threshold_from_arrays(y_true: np.ndarray, y_scores: np.ndarray,
+                               policy: str = "mcc") -> Tuple[float, Dict[str, float]]:
+    """Find threshold maximizing MCC or Youden's J on validation data.
+
+    Returns threshold and metrics dict at that threshold.
+    """
+    n = len(y_true)
+    if n == 0:
+        return 0.5, {"precision": 0.0, "recall": 0.0, "f1": 0.0, "balanced_accuracy": 0.0, "MCC": 0.0}
+    order = np.argsort(-y_scores)
+    y_sorted = y_true[order]
+    s_sorted = y_scores[order]
+    P = int(np.sum(y_sorted))
+    N = n - P
+    P = max(P, 1)
+    N = max(N, 1)
+
+    tp = 0
+    fp = 0
+    best_val = -1.0
+    best_idx = -1
+    best_metrics = None
+
+    for i in range(n):
+        tp += int(y_sorted[i])
+        fp += int(1 - y_sorted[i])
+        fn = P - tp
+        tn = N - fp
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / P if P else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+        tpr = recall
+        tnr = tn / (tn + fp) if (tn + fp) else 0.0
+        bal_acc = 0.5 * (tpr + tnr)
+        denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+        if denom == 0:
+            mcc = 0.0
+        else:
+            mcc = ((tp * tn) - (fp * fn)) / math.sqrt(denom)
+        if policy == "youden":
+            val = tpr + tnr - 1.0
+        else:
+            val = mcc
+        if val > best_val:
+            best_val = val
+            best_idx = i
+            best_metrics = {
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "balanced_accuracy": bal_acc,
+                "MCC": mcc,
+            }
+
+    threshold = float(s_sorted[best_idx]) if best_idx >= 0 else 0.5
+    return threshold, best_metrics or {"precision": 0.0, "recall": 0.0, "f1": 0.0, "balanced_accuracy": 0.0, "MCC": 0.0}
+
+
+def _pr_auc_from_arrays(y_true: np.ndarray, y_scores: np.ndarray) -> float:
+    n = len(y_true)
+    if n == 0:
+        return 0.0
+    order = np.argsort(-y_scores)
+    y_sorted = y_true[order]
+    P = np.sum(y_sorted)
+    if P == 0:
+        return 0.0
+    precisions = []
+    recalls = []
+    tp = 0
+    for i in range(n):
+        tp += int(y_sorted[i])
+        fp = (i + 1) - tp
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / P
+        precisions.append(precision)
+        recalls.append(recall)
+    # Step-wise integration: sum precision * delta_recall
+    auprc = 0.0
+    prev_recall = 0.0
+    for p, r in zip(precisions, recalls):
+        auprc += p * max(r - prev_recall, 0.0)
+        prev_recall = r
+    return float(auprc)
+
+
+def _roc_auc_from_arrays(y_true: np.ndarray, y_scores: np.ndarray) -> float:
+    n = len(y_true)
+    if n == 0:
+        return 0.0
+    order = np.argsort(-y_scores)
+    y_sorted = y_true[order]
+    P = np.sum(y_sorted)
+    N = n - P
+    if P == 0 or N == 0:
+        return 0.0
+    tps = np.cumsum(y_sorted)
+    fps = np.cumsum(1 - y_sorted)
+    tpr = tps / P
+    fpr = fps / N
+    # Prepend (0,0) and append (1,1)
+    fpr = np.concatenate(([0.0], fpr, [1.0]))
+    tpr = np.concatenate(([0.0], tpr, [1.0]))
+    # Trapezoidal rule
+    auc = np.trapz(tpr, fpr)
+    return float(auc)
+
+
+def evaluate_model(model, train_df: DataFrame, valid_df: DataFrame, name: str,
+                   threshold_policy: str = "mcc") -> Tuple[object, Dict[str, float]]:
     start = time.time()
     fitted = model.fit(train_df)
     fit_time = time.time() - start
     preds = (fitted.transform(valid_df)
              .select(TARGET_COL, "probability", "rawPrediction")
-             .withColumn("p1", vector_to_array("probability").getItem(1))
+             .withColumn("prob_array", vector_to_array("probability"))
+             .withColumn("prob_size", F.size(F.col("prob_array")))
+             .withColumn("p1", F.when(F.col("prob_size") > 1,
+                                      F.col("prob_array").getItem(1))
+                              .otherwise(F.col("prob_array").getItem(0)))
              .withColumn("yhat", (F.col("p1") >= 0.5).cast("int")))
     pr_eval = BinaryClassificationEvaluator(rawPredictionCol="rawPrediction", labelCol=TARGET_COL,
                                             metricName="areaUnderPR")
     roc_eval = BinaryClassificationEvaluator(rawPredictionCol="rawPrediction", labelCol=TARGET_COL,
                                              metricName="areaUnderROC")
-    pr_auc = pr_eval.evaluate(preds)
-    roc_auc = roc_eval.evaluate(preds)
+    # Collect to driver for custom AUC computations and threshold selection
+    data = preds.select(TARGET_COL, "p1").collect()
+    y_true = np.array([row[TARGET_COL] for row in data])
+    y_scores = np.array([row["p1"] for row in data])
+    # Custom AUCs to avoid vector length issues from Spark evaluator
+    pr_auc = _pr_auc_from_arrays(y_true, y_scores)
+    roc_auc = _roc_auc_from_arrays(y_true, y_scores)
     conf = confusion_and_stats(preds)
+
+    # Optimal threshold on validation according to policy
+    opt_t, opt_metrics = _best_threshold_from_arrays(y_true, y_scores, policy=threshold_policy)
     metrics = {
         "PR_AUC": pr_auc,
         "ROC_AUC": roc_auc,
@@ -175,25 +305,40 @@ def evaluate_model(model, train_df: DataFrame, valid_df: DataFrame, name: str) -
         "balanced_accuracy": conf["balanced_accuracy"],
         "MCC": conf["MCC"],
         "fit_time_s": round(fit_time, 2),
+        "opt_threshold_policy": threshold_policy,
+        "opt_threshold": float(opt_t),
+        "opt_precision": float(opt_metrics["precision"]),
+        "opt_recall": float(opt_metrics["recall"]),
+        "opt_f1": float(opt_metrics["f1"]),
+        "opt_balanced_accuracy": float(opt_metrics["balanced_accuracy"]),
+        "opt_MCC": float(opt_metrics["MCC"]),
     }
     print(f"{name} (VALID): PR-AUC={pr_auc:.4f} | ROC-AUC={roc_auc:.4f} | "
           f"Prec={conf['precision']:.4f} | Rec={conf['recall']:.4f} | F1={conf['f1']:.4f} | "
           f"BalAcc={conf['balanced_accuracy']:.4f} | MCC={conf['MCC']:.4f} | "
           f"train_time_s={metrics['fit_time_s']}")
+    print(f"  -> Opt threshold ({threshold_policy}) = {opt_t:.4f} | "
+          f"BalAcc={opt_metrics['balanced_accuracy']:.4f} | MCC={opt_metrics['MCC']:.4f} | F1={opt_metrics['f1']:.4f}")
     return fitted, metrics
 
 
-def evaluate_on_split(model, df: DataFrame, split_name: str) -> Tuple[Dict[str, float], DataFrame]:
+def evaluate_on_split(model, df: DataFrame, split_name: str, threshold: float = 0.5) -> Tuple[Dict[str, float], DataFrame]:
     preds = (model.transform(df)
-             .select(TARGET_COL, "probability", "rawPrediction")
-             .withColumn("p1", vector_to_array("probability").getItem(1))
-             .withColumn("yhat", (F.col("p1") >= 0.5).cast("int")))
-    pr_eval = BinaryClassificationEvaluator(rawPredictionCol="rawPrediction", labelCol=TARGET_COL,
+             .select(TARGET_COL, "probability")
+             .withColumn("p1", F.when(F.size(vector_to_array("probability")) > 1,
+                                       vector_to_array("probability").getItem(1))
+                               .otherwise(F.lit(0.0)))
+             .withColumn("yhat", (F.col("p1") >= F.lit(threshold)).cast("int")))
+    pr_eval = BinaryClassificationEvaluator(rawPredictionCol="probability", labelCol=TARGET_COL,
                                             metricName="areaUnderPR")
-    roc_eval = BinaryClassificationEvaluator(rawPredictionCol="rawPrediction", labelCol=TARGET_COL,
+    roc_eval = BinaryClassificationEvaluator(rawPredictionCol="probability", labelCol=TARGET_COL,
                                              metricName="areaUnderROC")
-    pr_auc = pr_eval.evaluate(preds)
-    roc_auc = roc_eval.evaluate(preds)
+    # Collect to driver for custom AUC computations and threshold selection
+    data = preds.select(TARGET_COL, "p1").collect()
+    y_true = np.array([row[TARGET_COL] for row in data])
+    y_scores = np.array([row["p1"] for row in data])
+    pr_auc = _pr_auc_from_arrays(y_true, y_scores)
+    roc_auc = _roc_auc_from_arrays(y_true, y_scores)
     conf = confusion_and_stats(preds)
     metrics = {
         "PR_AUC": pr_auc,
@@ -212,6 +357,7 @@ def evaluate_on_split(model, df: DataFrame, split_name: str) -> Tuple[Dict[str, 
           f"Prec={conf['precision']:.4f} | Rec={conf['recall']:.4f} | F1={conf['f1']:.4f} | "
           f"BalAcc={conf['balanced_accuracy']:.4f} | MCC={conf['MCC']:.4f} "
           f"| TP={conf['TP']} FP={conf['FP']} TN={conf['TN']} FN={conf['FN']}")
+    metrics["applied_threshold"] = float(threshold)
     return metrics, preds
 
 
@@ -337,7 +483,7 @@ def plot_pr_curve(preds: DataFrame, output_path: Path) -> None:
     plt.plot(recalls, precisions, linewidth=2, color='blue')
     plt.xlabel('Recall', fontsize=12)
     plt.ylabel('Precision', fontsize=12)
-    plt.title('Precision-Recall Curve (Validation)', fontsize=14)
+    plt.title('PR curve best model', fontsize=14)
     plt.grid(True, alpha=0.3)
     plt.xlim([0, 1])
     plt.ylim([0, 1])
@@ -387,73 +533,284 @@ def write_metrics_csv(path: Path, metrics_dict: Dict[str, Dict[str, float]]) -> 
     print(f"Metrics CSV saved to {path}")
 
 
-def write_report(path: Path,
-                 overall_balance: Dict[str, float],
-                 split_stats: Dict[str, Dict[str, float]],
-                 valid_metrics: Dict[str, Dict[str, float]],
-                 best_model_key: str,
-                 test_metrics: Dict[str, float],
-                 calibration_rows: List[Dict[str, float]],
-                 pos_weight: float,
-                 scaling_results: List[Dict[str, float]] = None) -> None:
-    lines: List[str] = []
-    lines.append("# CS-657 Assignment 2 – Imbalanced Molecular SA Classifier\n")
+def plot_imbalance_method_bars(metrics_dict: Dict[str, Dict[str, float]], pr_path: Path, f1_path: Path) -> None:
+    """Plot bar charts comparing PR-AUC and F1 across imbalance-handling methods."""
+    order = [
+        "logistic_regression",
+        "logistic_regression_weighted",
+        "logistic_regression_undersampled",
+        "logistic_regression_oversampled",
+    ]
+    labels = [human_model_name(k) for k in order if k in metrics_dict]
+    pr_vals = [metrics_dict[k]["PR_AUC"] for k in order if k in metrics_dict]
+    f1_vals = [metrics_dict[k].get("f1", 0.0) for k in order if k in metrics_dict]
 
-    lines.append("## Data & Relabeling\n")
-    if overall_balance["feature_mode"] == "fp_columns":
-        feature_desc = "fp_0..fp_2047 columns"
-    elif overall_balance["feature_mode"] == "numeric_columns":
-        feature_desc = "digit-indexed fingerprint columns (0..2047)"
-    else:
-        feature_desc = "2048-bit fp_bits string"
-    lines.append(f"- Rows ingested after cleaning: **{overall_balance['total_rows']:,}**\n")
-    lines.append(f"- Feature extraction mode: **{overall_balance['feature_mode']}** ({feature_desc})\n")
-    lines.append(f"- 80th percentile threshold q80({SA_SCORE_COL}): **{overall_balance['q80']:.4f}**\n")
-    pos_frac = overall_balance["positive_fraction"]
-    neg_frac = overall_balance["negative_fraction"]
-    lines.append(f"- Labeling yields target80 positive fraction ≈ **{pos_frac:.4f}** (negative fraction **{neg_frac:.4f}**)\n")
+    # PR-AUC bars
+    plt.figure(figsize=(8, 5))
+    plt.bar(range(len(labels)), pr_vals, color=["#4C78A8", "#F58518", "#54A24B", "#E45756"])  # distinct colors
+    plt.xticks(range(len(labels)), labels, rotation=20, ha='right')
+    plt.ylabel('PR-AUC', fontsize=12)
+    plt.title('Imbalance Handling: PR-AUC by Method (Validation)', fontsize=13)
+    plt.ylim(0, 1.0)
+    plt.tight_layout()
+    plt.savefig(pr_path, dpi=150)
+    plt.close()
+    print(f"Imbalance method PR-AUC bar chart saved to {pr_path}")
 
-    lines.append("\n## Split Summary\n")
-    lines.append("| Split | Rows | Positive | Negative | Pos Fraction |\n")
-    lines.append("| --- | ---: | ---: | ---: | ---: |\n")
-    for key in ["train", "valid", "test"]:
-        stats = split_stats[key]
-        lines.append(f"| {key.title()} | {stats['rows']:,} | {stats['positive']:,} | {stats['negative']:,} | {stats['positive_fraction']:.4f} |\n")
-
-    lines.append("\n## Validation Metrics (PR-AUC focus)\n")
-    lines.append("| Model | PR-AUC | ROC-AUC | Balanced Acc | MCC | Train Time (s) |\n")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: |\n")
-    for key in ["logistic_regression", "logistic_regression_weighted"]:
-        metrics = valid_metrics[key]
-        lines.append(f"| {human_model_name(key)} | {metrics['PR_AUC']:.4f} | {metrics['ROC_AUC']:.4f} | "
-                     f"{metrics['balanced_accuracy']:.4f} | {metrics['MCC']:.4f} | {metrics['fit_time_s']:.2f} |\n")
-    lines.append(f"\n*Random Forest validation PR-AUC (for reference): {valid_metrics['random_forest']['PR_AUC']:.4f}*\n")
-
-    lines.append("\n## Test Metrics (Best Model)\n")
-    lines.append(f"- Selected model: **{human_model_name(best_model_key)}**\n")
-    lines.append(f"- PR-AUC: **{test_metrics['PR_AUC']:.4f}**, ROC-AUC: **{test_metrics['ROC_AUC']:.4f}**\n")
-    lines.append(f"- Balanced Accuracy: **{test_metrics['balanced_accuracy']:.4f}**, MCC: **{test_metrics['MCC']:.4f}**\n")
-    lines.append(f"- Confusion matrix @0.5 → TP={test_metrics['TP']}, FP={test_metrics['FP']}, "
-                 f"TN={test_metrics['TN']}, FN={test_metrics['FN']}\n")
-
-    lines.append("\n## Calibration (VALID, Best Model)\n")
-    lines.append("| Bin | Mean Pred | Empirical Pos Rate | Count |\n")
-    lines.append("| --- | ---: | ---: | ---: |\n")
-    for row in calibration_rows:
-        lines.append(f"| {row['bin']} | {row['mean_pred']:.4f} | {row['empirical_pos_rate']:.4f} | {row['count']} |\n")
-    lines.append("\n- Lower bins should stay near zero; monitor for over-confidence in the top bins.\n")
-    lines.append("- Weighted LR tugged probabilities upward for the minority, but bins remain monotone.\n")
-
-    lines.append("\n## Discussion & Justification\n")
-    lines.append(f"- **PR-AUC priority**: With ~20% positives, PR-AUC reflects precision/recall trade-offs better than ROC-AUC; it guides which model keeps minority alerts accurate under imbalance.\n")
-    lines.append(f"- **Class weights**: Using pos_weight = neg/pos ≈ {pos_weight:.2f} leverages Spark's native weighting, avoiding heavy resampling loops while boosting recall on hard (positive) molecules.\n")
-    lines.append("- **Laptop readiness**: Single-pass training with capped rows and three fixed models finishes under the 6 GB driver budget; outputs feed directly into the submission packet.\n")
-
-    path.write_text("".join(lines), encoding="utf-8")
+    # F1 bars
+    plt.figure(figsize=(8, 5))
+    plt.bar(range(len(labels)), f1_vals, color=["#4C78A8", "#F58518", "#54A24B", "#E45756"])  # reuse palette
+    plt.xticks(range(len(labels)), labels, rotation=20, ha='right')
+    plt.ylabel('F1', fontsize=12)
+    plt.title('Imbalance Handling: F1 by Method (Validation)', fontsize=13)
+    plt.ylim(0, 1.0)
+    plt.tight_layout()
+    plt.savefig(f1_path, dpi=150)
+    plt.close()
+    print(f"Imbalance method F1 bar chart saved to {f1_path}")
 
 
-# Import comprehensive report generator
-from report_generator import write_comprehensive_report
+def plot_pr_auc_methods_lr_rf(metrics_dict: Dict[str, Dict[str, float]], output_path: Path) -> None:
+    """Grouped bar chart: PR-AUC for Class-weighted, Undersampled, Oversampled methods for LR and RF."""
+    groups = ["Class-weighted", "Undersampled", "Oversampled"]
+    lr_keys = [
+        "logistic_regression_weighted",
+        "logistic_regression_undersampled",
+        "logistic_regression_oversampled",
+    ]
+    rf_keys = [
+        "random_forest_weighted",
+        "random_forest_undersampled",
+        "random_forest_oversampled",
+    ]
+    lr_vals = [metrics_dict[k]["PR_AUC"] for k in lr_keys if k in metrics_dict]
+    rf_vals = [metrics_dict[k]["PR_AUC"] for k in rf_keys if k in metrics_dict]
+
+    n = len(groups)
+    x = np.arange(n)
+    width = 0.35
+
+    plt.figure(figsize=(9, 5))
+    plt.bar(x - width/2, lr_vals, width, label='LR', color='#4C78A8')
+    plt.bar(x + width/2, rf_vals, width, label='RF', color='#F58518')
+    plt.xticks(x, groups)
+    plt.ylabel('PR-AUC', fontsize=12)
+    plt.title('PR-AUC by imbalance method (LR vs RF, validation)', fontsize=13)
+    plt.ylim(0, 1.0)
+    plt.legend(loc='best')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"Imbalance methods LR vs RF PR-AUC bar chart saved to {output_path}")
+
+
+def plot_scaling_results(scaling_rows: List[Dict[str, float]],
+                         pr_path: Path,
+                         time_path: Path) -> None:
+    """Line plots showing PR-AUC and training time as dataset size scales."""
+    if not scaling_rows:
+        return
+    scaling_rows = sorted(scaling_rows, key=lambda r: r["train_rows"])
+    sizes = [row["train_rows"] for row in scaling_rows]
+    pr_vals = [row["pr_auc"] for row in scaling_rows]
+    time_vals = [row["train_time_s"] for row in scaling_rows]
+
+    plt.figure(figsize=(7, 4.5))
+    plt.plot(sizes, pr_vals, marker='o', color='#4C78A8')
+    plt.xlabel('Training rows')
+    plt.ylabel('PR-AUC')
+    plt.title('Scaling experiment: PR-AUC vs training size')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(pr_path, dpi=150)
+    plt.close()
+    print(f"Scaling PR-AUC plot saved to {pr_path}")
+
+    plt.figure(figsize=(7, 4.5))
+    plt.plot(sizes, time_vals, marker='o', color='#F58518')
+    plt.xlabel('Training rows')
+    plt.ylabel('Train time (s)')
+    plt.title('Scaling experiment: training time vs training size')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(time_path, dpi=150)
+    plt.close()
+    print(f"Scaling training time plot saved to {time_path}")
+
+
+def _compute_pr_points_from_model(fitted_model, df: DataFrame) -> Tuple[List[float], List[float]]:
+    preds = (fitted_model.transform(df)
+             .select(TARGET_COL, "probability")
+             .withColumn("p1", F.when(F.size(vector_to_array("probability")) > 1,
+                                       vector_to_array("probability").getItem(1))
+                               .otherwise(F.lit(0.0))))
+    data = preds.select(TARGET_COL, "p1").collect()
+    y_true = np.array([row[TARGET_COL] for row in data])
+    y_scores = np.array([row["p1"] for row in data])
+    if len(y_true) == 0:
+        return [0.0, 1.0], [1.0, 0.0]
+    sorted_indices = np.argsort(-y_scores)
+    y_true_sorted = y_true[sorted_indices]
+    precisions, recalls = [], []
+    total_pos = np.sum(y_true)
+    for i in range(len(y_true_sorted)):
+        tp = np.sum(y_true_sorted[:i+1])
+        fp = (i + 1) - tp
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / total_pos if total_pos > 0 else 0.0
+        precisions.append(precision)
+        recalls.append(recall)
+    return recalls, precisions
+
+
+def plot_pr_curve_lr_rf(lr_fitted, rf_fitted, valid_df: DataFrame, output_path: Path) -> None:
+    """Plot a PR curve with two lines (LR vs RF) on the same validation split."""
+    rec_lr, prec_lr = _compute_pr_points_from_model(lr_fitted, valid_df)
+    rec_rf, prec_rf = _compute_pr_points_from_model(rf_fitted, valid_df)
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(rec_lr, prec_lr, linewidth=2, color='#4C78A8', label='Logistic Regression')
+    plt.plot(rec_rf, prec_rf, linewidth=2, color='#F58518', label='Random Forest')
+    plt.xlabel('Recall', fontsize=12)
+    plt.ylabel('Precision', fontsize=12)
+    plt.title('PR curve: LR vs RF (validation)', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.xlim([0, 1])
+    plt.ylim([0, 1])
+    plt.legend(loc='best')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"LR vs RF PR curve saved to {output_path}")
+
+
+def plot_pr_curve_lr_rf_methods(
+    lr_w_fitted,
+    lr_us_fitted,
+    lr_os_fitted,
+    rf_w_fitted,
+    rf_us_fitted,
+    rf_os_fitted,
+    valid_df: DataFrame,
+    output_path: Path,
+) -> None:
+    """Plot PR curves for six models: LR and RF under three imbalance strategies each."""
+    series = [
+        (lr_w_fitted, 'LR (weighted)', '#4C78A8'),
+        (lr_us_fitted, 'LR (undersampled)', '#72B7B2'),
+        (lr_os_fitted, 'LR (oversampled)', '#54A24B'),
+        (rf_w_fitted, 'RF (weighted)', '#F58518'),
+        (rf_us_fitted, 'RF (undersampled)', '#E45756'),
+        (rf_os_fitted, 'RF (oversampled)', '#B279A2'),
+    ]
+
+    plt.figure(figsize=(9, 6))
+    for fitted, label, color in series:
+        recalls, precisions = _compute_pr_points_from_model(fitted, valid_df)
+        plt.plot(recalls, precisions, linewidth=2, label=label, color=color)
+    plt.xlabel('Recall', fontsize=12)
+    plt.ylabel('Precision', fontsize=12)
+    plt.title('PR curve: LR/RF with imbalance strategies (validation)', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.xlim([0, 1])
+    plt.ylim([0, 1])
+    plt.legend(loc='best', ncol=2)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"LR/RF imbalance strategies PR curve saved to {output_path}")
+
+
+def _compute_roc_points_from_model(fitted_model, df: DataFrame) -> Tuple[List[float], List[float]]:
+    preds = (fitted_model.transform(df)
+             .select(TARGET_COL, "probability")
+             .withColumn("p1", F.when(F.size(vector_to_array("probability")) > 1,
+                                       vector_to_array("probability").getItem(1))
+                               .otherwise(F.lit(0.0))))
+    data = preds.select(TARGET_COL, "p1").collect()
+    y_true = np.array([row[TARGET_COL] for row in data])
+    y_scores = np.array([row["p1"] for row in data])
+    if len(y_true) == 0:
+        return [0.0, 1.0], [0.0, 1.0]
+    # Sort by score descending
+    order = np.argsort(-y_scores)
+    y_true_sorted = y_true[order]
+    # Unique thresholds at sorted scores
+    tps = np.cumsum(y_true_sorted)
+    fps = np.cumsum(1 - y_true_sorted)
+    P = np.sum(y_true_sorted)
+    N = len(y_true_sorted) - P
+    # Avoid division by zero
+    P = max(P, 1)
+    N = max(N, 1)
+    tpr = tps / P
+    fpr = fps / N
+    # Prepend (0,0) and append (1,1)
+    fpr = np.concatenate(([0.0], fpr, [1.0]))
+    tpr = np.concatenate(([0.0], tpr, [1.0]))
+    return list(fpr), list(tpr)
+
+
+def plot_roc_curve_lr_rf(lr_fitted, rf_fitted, valid_df: DataFrame, output_path: Path) -> None:
+    """Plot ROC curves (LR vs RF) on the same validation split."""
+    fpr_lr, tpr_lr = _compute_roc_points_from_model(lr_fitted, valid_df)
+    fpr_rf, tpr_rf = _compute_roc_points_from_model(rf_fitted, valid_df)
+
+    plt.figure(figsize=(8, 6))
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Chance')
+    plt.plot(fpr_lr, tpr_lr, linewidth=2, color='#4C78A8', label='Logistic Regression')
+    plt.plot(fpr_rf, tpr_rf, linewidth=2, color='#F58518', label='Random Forest')
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize=12)
+    plt.title('ROC curve: LR vs RF (validation)', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.xlim([0, 1])
+    plt.ylim([0, 1])
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"LR vs RF ROC curve saved to {output_path}")
+
+
+def plot_roc_curve_lr_rf_methods(
+    lr_w_fitted,
+    lr_us_fitted,
+    lr_os_fitted,
+    rf_w_fitted,
+    rf_us_fitted,
+    rf_os_fitted,
+    valid_df: DataFrame,
+    output_path: Path,
+) -> None:
+    """Plot six ROC curves (LR/RF under class-weighted, undersampled, oversampled)."""
+    series = [
+        (lr_w_fitted, 'LR (weighted)', '#4C78A8'),
+        (lr_us_fitted, 'LR (undersampled)', '#72B7B2'),
+        (lr_os_fitted, 'LR (oversampled)', '#54A24B'),
+        (rf_w_fitted, 'RF (weighted)', '#F58518'),
+        (rf_us_fitted, 'RF (undersampled)', '#E45756'),
+        (rf_os_fitted, 'RF (oversampled)', '#B279A2'),
+    ]
+
+    plt.figure(figsize=(9, 6))
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Chance')
+    for fitted, label, color in series:
+        fpr, tpr = _compute_roc_points_from_model(fitted, valid_df)
+        plt.plot(fpr, tpr, linewidth=2, label=label, color=color)
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize=12)
+    plt.title('ROC curve: LR/RF with imbalance strategies (validation)', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.xlim([0, 1])
+    plt.ylim([0, 1])
+    plt.legend(loc='lower right', ncol=2)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"LR/RF imbalance strategies ROC curve saved to {output_path}")
+
+
 
 # ----------------------------------------------------------------------
 # Main pipeline executes immediately when this script is run via spark-submit
@@ -474,27 +831,66 @@ df_raw = (spark.read
           .option("inferSchema", True)
           .csv(BATCH_GLOB)
           .dropna(subset=[SMILES_COL, SA_SCORE_COL]))
-if "SA_label" in df_raw.columns:
-    df_raw = df_raw.drop("SA_label")
 df_raw = df_raw.withColumn(SA_SCORE_COL, F.col(SA_SCORE_COL).cast("double"))
 
+# Create binary labels based on SA_score quantiles (80/20 split)
+# Top 20% (highest SA_score) = "hard" (1), Bottom 80% = "easy" (0)
+print("Computing 80th percentile of SA_score for label creation...")
+quantile_80 = df_raw.approxQuantile(SA_SCORE_COL, [0.8], 0.01)[0]
+print(f"80th percentile threshold: {quantile_80:.4f}")
+print(f"Molecules with SA_score >= {quantile_80:.4f} labeled as 'hard' (1)")
+print(f"Molecules with SA_score < {quantile_80:.4f} labeled as 'easy' (0)")
+
+# Create binary label: 1 if SA_score >= 80th percentile, else 0
+df_raw = df_raw.withColumn(
+    TARGET_COL,
+    F.when(F.col(SA_SCORE_COL) >= quantile_80, 1).otherwise(0)
+)
+
 df_feat, feature_mode = detect_features(df_raw)
-df = df_feat.dropna(subset=["features", SA_SCORE_COL])
 
-q80 = df.approxQuantile(SA_SCORE_COL, [0.80], 1e-4)[0]
-df = df.withColumn(TARGET_COL, (F.col(SA_SCORE_COL) >= F.lit(q80)).cast("int"))
+if not _RDKIT_AVAILABLE:
+    raise RuntimeError(
+        "RDKit is required for scaffold-aware splitting but is not available. "
+        "Please install RDKit (e.g., pip install rdkit-pypi) and retry."
+    )
 
-# Retain only necessary columns going forward to reduce memory footprint
-df = df.select(SA_SCORE_COL, TARGET_COL, "features")
+# Compute Bemis–Murcko scaffold for scaffold-aware split
+def _smiles_to_scaffold(smiles: str) -> str:
+    if not smiles:
+        return ""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return ""
+    scaf = MurckoScaffold.GetScaffoldForMol(mol)
+    if scaf is None:
+        return ""
+    return Chem.MolToSmiles(scaf, isomericSmiles=False)
+
+smiles_to_scaffold_udf = F.udf(_smiles_to_scaffold, T.StringType())
+
+df_feat = df_feat.withColumn("scaffold", smiles_to_scaffold_udf(F.col(SMILES_COL)))
+df = df_feat.dropna(subset=["features", SA_SCORE_COL, TARGET_COL])
+
+# Scaffold-aware split: hash scaffold to buckets
+df = df.withColumn(
+    "scaffold_key",
+    F.coalesce(F.col("scaffold"), F.col(SMILES_COL)).cast("string")
+)
+df = df.withColumn("bucket", F.pmod(F.xxhash64("scaffold_key"), F.lit(100)))
+
+# Retain only necessary columns going forward to reduce memory footprint (keep bucket for split filters)
+df = df.select(SA_SCORE_COL, TARGET_COL, "features", "bucket")
 
 total_rows = df.count()
 overall_counts = collect_class_balance(df)
 print(f"Total rows after preprocessing: {total_rows:,}")
-print(f"q80({SA_SCORE_COL}) = {q80:.4f}")
 print("Overall class balance:")
 df.groupBy(TARGET_COL).count().orderBy(TARGET_COL).show(truncate=False)
 
-train_df, valid_df, test_df = df.randomSplit([0.8, 0.1, 0.1], seed=SEED)
+train_df = df.filter(F.col("bucket") < 80).drop("bucket")
+valid_df = df.filter((F.col("bucket") >= 80) & (F.col("bucket") < 90)).drop("bucket")
+test_df = df.filter(F.col("bucket") >= 90).drop("bucket")
 
 train_count = train_df.count()
 if MAX_TRAIN_ROWS and train_count > MAX_TRAIN_ROWS:
@@ -532,6 +928,17 @@ rf_model = RandomForestClassifier(
 )
 lr_weighted_model = LogisticRegression(featuresCol="features", labelCol=TARGET_COL,
                                        weightCol="weight", maxIter=50)
+rf_weighted_model = RandomForestClassifier(
+    featuresCol="features",
+    labelCol=TARGET_COL,
+    weightCol="weight",
+    numTrees=80,
+    maxDepth=12,
+    maxBins=64,
+    subsamplingRate=0.8,
+    featureSubsetStrategy="sqrt",
+    seed=SEED,
+)
 
 lr_fitted, lr_metrics = evaluate_model(lr_model, train_df, valid_df, "Logistic Regression")
 rf_fitted, rf_metrics = evaluate_model(rf_model, train_df, valid_df, "Random Forest")
@@ -542,6 +949,8 @@ train_weighted = train_df.withColumn(
 )
 lr_w_fitted, lr_w_metrics = evaluate_model(lr_weighted_model, train_weighted, valid_df,
                                            "Logistic Regression (class-weighted)")
+rf_w_fitted, rf_w_metrics = evaluate_model(rf_weighted_model, train_weighted, valid_df,
+                                           "Random Forest (class-weighted)")
 
 # Undersampling and oversampling strategies
 print("\nTraining models with imbalance handling:")
@@ -551,11 +960,17 @@ summarize_split("TRAIN (undersampled)", train_undersampled)
 lr_us_fitted, lr_us_metrics = evaluate_model(lr_model, train_undersampled, valid_df,
                                               "Logistic Regression (undersampled)")
 
+rf_us_fitted, rf_us_metrics = evaluate_model(rf_model, train_undersampled, valid_df,
+                                             "Random Forest (undersampled)")
+
 train_oversampled = oversample_minority(train_df)
 train_oversampled = train_oversampled.persist(StorageLevel.MEMORY_AND_DISK)
 summarize_split("TRAIN (oversampled)", train_oversampled)
 lr_os_fitted, lr_os_metrics = evaluate_model(lr_model, train_oversampled, valid_df,
                                               "Logistic Regression (oversampled)")
+
+rf_os_fitted, rf_os_metrics = evaluate_model(rf_model, train_oversampled, valid_df,
+                                             "Random Forest (oversampled)")
 
 valid_metrics = {
     "logistic_regression": lr_metrics,
@@ -563,6 +978,9 @@ valid_metrics = {
     "logistic_regression_weighted": lr_w_metrics,
     "logistic_regression_undersampled": lr_us_metrics,
     "logistic_regression_oversampled": lr_os_metrics,
+    "random_forest_weighted": rf_w_metrics,
+    "random_forest_undersampled": rf_us_metrics,
+    "random_forest_oversampled": rf_os_metrics,
 }
 
 best_name, best_fitted = max(
@@ -572,12 +990,17 @@ best_name, best_fitted = max(
         ("logistic_regression_weighted", lr_w_fitted, lr_w_metrics),
         ("logistic_regression_undersampled", lr_us_fitted, lr_us_metrics),
         ("logistic_regression_oversampled", lr_os_fitted, lr_os_metrics),
+        ("random_forest_weighted", rf_w_fitted, rf_w_metrics),
+        ("random_forest_undersampled", rf_us_fitted, rf_us_metrics),
+        ("random_forest_oversampled", rf_os_fitted, rf_os_metrics),
     ],
     key=lambda item: item[2]["PR_AUC"]
 )[:2]
 print(f"\nBest model by VALID PR-AUC: {best_name}")
 
-test_metrics, _ = evaluate_on_split(best_fitted, test_df, "TEST")
+# Apply validation-selected threshold for the best model when evaluating on TEST
+best_opt_threshold = valid_metrics.get(best_name, {}).get("opt_threshold", 0.5)
+test_metrics, _ = evaluate_on_split(best_fitted, test_df, "TEST", threshold=float(best_opt_threshold))
 
 _, valid_preds = evaluate_on_split(best_fitted, valid_df, "VALID (best)")
 calib_rows = calibration_table(valid_preds, CALIBRATION_BINS)
@@ -588,17 +1011,52 @@ for row in calib_rows:
 
 # Generate visualizations
 print("\nGenerating visualizations...")
-plot_pr_curve(valid_preds, OUTPUT_DIR / "pr_curve_valid.png")
+plot_pr_curve(valid_preds, OUTPUT_DIR / "pr_curve_best_model.png")
 plot_calibration_curve(calib_rows, OUTPUT_DIR / "calibration_curve_valid.png")
 
-# Scaling experiment
+# Baseline comparison PR curve (LR vs RF on the same validation split)
+plot_pr_curve_lr_rf(lr_fitted, rf_fitted, valid_df, OUTPUT_DIR / "pr_curve_lr_rf.png")
+# Baseline comparison ROC curve (LR vs RF)
+plot_roc_curve_lr_rf(lr_fitted, rf_fitted, valid_df, OUTPUT_DIR / "roc_curve_lr_rf.png")
+
+# Six-curve PR comparison for LR/RF under imbalance strategies
+plot_pr_curve_lr_rf_methods(
+    lr_w_fitted,
+    lr_us_fitted,
+    lr_os_fitted,
+    rf_w_fitted,
+    rf_us_fitted,
+    rf_os_fitted,
+    valid_df,
+    OUTPUT_DIR / "pr_curve_lr_rf_methods.png",
+)
+# Six-curve ROC comparison for LR/RF under imbalance strategies
+plot_roc_curve_lr_rf_methods(
+    lr_w_fitted,
+    lr_us_fitted,
+    lr_os_fitted,
+    rf_w_fitted,
+    rf_us_fitted,
+    rf_os_fitted,
+    valid_df,
+    OUTPUT_DIR / "roc_curve_lr_rf_methods.png",
+)
+
+# Method comparison plots (PR-AUC and F1 across imbalance handling methods)
+plot_imbalance_method_bars(
+    valid_metrics,
+    OUTPUT_DIR / "imbalance_methods_pr_auc.png",
+    OUTPUT_DIR / "imbalance_methods_f1.png",
+)
+plot_pr_auc_methods_lr_rf(valid_metrics, OUTPUT_DIR / "imbalance_methods_pr_auc_lr_rf.png")
+
 print("\nRunning scaling experiments...")
-scaling_results = []
+scaling_results: List[Dict[str, float]] = []
 for size in [100_000, 500_000, 1_000_000]:
     if train_count < size:
         print(f"Skipping size {size:,} (only {train_count:,} training samples available)")
         continue
-    
+
     print(f"\nScaling experiment with {size:,} training samples...")
     fraction = size / float(train_count)
     train_sample = train_df.sample(withReplacement=False, fraction=fraction, seed=SEED)
@@ -608,19 +1066,32 @@ for size in [100_000, 500_000, 1_000_000]:
     )
     train_sample_weighted = train_sample_weighted.persist(StorageLevel.MEMORY_AND_DISK)
     actual_size = train_sample_weighted.count()
-    
+    if actual_size == 0:
+        train_sample_weighted.unpersist()
+        print(f"  No rows sampled for size {size:,}; skipping.")
+        continue
+
     start_time = time.time()
-    lr_scale_model = LogisticRegression(featuresCol="features", labelCol=TARGET_COL,
-                                        weightCol="weight", maxIter=50)
+    lr_scale_model = LogisticRegression(
+        featuresCol="features",
+        labelCol=TARGET_COL,
+        weightCol="weight",
+        maxIter=50,
+    )
     lr_scale_fitted = lr_scale_model.fit(train_sample_weighted)
     train_time = time.time() - start_time
-    
-    preds_scale = lr_scale_fitted.transform(valid_df).select(TARGET_COL, "rawPrediction")
-    pr_eval_scale = BinaryClassificationEvaluator(rawPredictionCol="rawPrediction",
-                                                   labelCol=TARGET_COL,
-                                                   metricName="areaUnderPR")
-    pr_auc_scale = pr_eval_scale.evaluate(preds_scale)
-    
+
+    preds_scale = lr_scale_fitted.transform(valid_df).select(TARGET_COL, "probability")
+    data_scale = (preds_scale
+                  .withColumn("p1", F.when(F.size(vector_to_array("probability")) > 1,
+                                            vector_to_array("probability").getItem(1))
+                                     .otherwise(F.lit(0.0)))
+                  .select(TARGET_COL, "p1")
+                  .collect())
+    y_true_s = np.array([row[TARGET_COL] for row in data_scale])
+    y_scores_s = np.array([row["p1"] for row in data_scale])
+    pr_auc_scale = _pr_auc_from_arrays(y_true_s, y_scores_s)
+
     result = {
         "train_rows": actual_size,
         "train_time_s": round(train_time, 2),
@@ -628,7 +1099,7 @@ for size in [100_000, 500_000, 1_000_000]:
     }
     scaling_results.append(result)
     print(f"  Size={actual_size:,}, Time={train_time:.2f}s, PR-AUC={pr_auc_scale:.4f}")
-    
+
     train_sample_weighted.unpersist()
 
 # Persist outputs
@@ -639,7 +1110,6 @@ overall_balance = {
     "positive_fraction": (overall_counts.get(1, 0) / total_rows) if total_rows else 0.0,
     "negative_fraction": (overall_counts.get(0, 0) / total_rows) if total_rows else 0.0,
     "feature_mode": feature_mode,
-    "q80": q80,
 }
 
 print("\nWriting outputs...")
@@ -665,11 +1135,26 @@ if scaling_results:
         for row in scaling_results:
             writer.writerow(row)
     print(f"Scaling results saved to {OUTPUT_DIR / 'scaling_results.csv'}")
+    plot_scaling_results(
+        scaling_results,
+        OUTPUT_DIR / "scaling_pr_auc.png",
+        OUTPUT_DIR / "scaling_train_time.png",
+    )
 
 # Generate comprehensive report
-write_comprehensive_report(Path("REPORT.md"), overall_balance, split_stats, valid_metrics,
-                           best_name, test_metrics, calib_rows, pos_weight, scaling_results)
+write_comprehensive_report(
+    Path("REPORT.md"),
+    overall_balance,
+    split_stats,
+    valid_metrics,
+    best_name,
+    test_metrics,
+    calib_rows,
+    pos_weight,
+    scaling_results,
+)
 print("Comprehensive report written to REPORT.md")
+
 
 print("\nAll artifacts written to outputs/:")
 artifact_list = [
@@ -677,10 +1162,19 @@ artifact_list = [
     "metrics_test.json", "metrics_test.csv",
     "class_balance_overall.json", "class_balance_by_split.json",
     "split_stats.txt", "calibration_valid.csv",
-    "pr_curve_valid.png", "calibration_curve_valid.png"
+    "pr_curve_best_model.png", "calibration_curve_valid.png",
+    "pr_curve_lr_rf.png", "pr_curve_lr_rf_methods.png",
+    "roc_curve_lr_rf.png", "roc_curve_lr_rf_methods.png",
+    "imbalance_methods_pr_auc.png", "imbalance_methods_f1.png",
+    "imbalance_methods_pr_auc_lr_rf.png"
 ]
 if scaling_results:
-    artifact_list.extend(["scaling_results.json", "scaling_results.csv"])
+    artifact_list.extend([
+        "scaling_results.json",
+        "scaling_results.csv",
+        "scaling_pr_auc.png",
+        "scaling_train_time.png",
+    ])
 for path in artifact_list:
     print(f"  - {OUTPUT_DIR / path}")
 

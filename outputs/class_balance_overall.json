@@ -1,9 +1,8 @@
 {
   "total_rows": 1924396,
-  "positive": 384955,
-  "negative": 1539441,
-  "positive_fraction": 0.20003938898230925,
-  "negative_fraction": 0.7999606110176908,
-  "feature_mode": "numeric_columns",
-  "q80": 2.7921802195720797
+  "positive": 394461,
+  "negative": 1529935,
+  "positive_fraction": 0.2049791207215147,
+  "negative_fraction": 0.7950208792784853,
+  "feature_mode": "numeric_columns"
 }
