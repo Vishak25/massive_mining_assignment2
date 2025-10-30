@@ -60,7 +60,7 @@ CALIBRATION_BINS = 10
 SMILES_COL = "SMILES"
 SA_SCORE_COL = "SA_score"
 TARGET_COL = "SA_label"
-MAX_TRAIN_ROWS = 300_000  # keep runtime manageable on a laptop
+MAX_TRAIN_ROWS = 500_000  # keep runtime manageable on a laptop
 
 
 # ----------------------------------------------------------------------
@@ -418,6 +418,9 @@ def human_model_name(key: str) -> str:
         "logistic_regression_weighted": "Logistic Regression (class-weighted)",
         "logistic_regression_undersampled": "Logistic Regression (undersampled)",
         "logistic_regression_oversampled": "Logistic Regression (oversampled)",
+        "random_forest_weighted": "Random Forest (class-weighted)",
+        "random_forest_undersampled": "Random Forest (undersampled)",
+        "random_forest_oversampled": "Random Forest (oversampled)",
     }.get(key, key)
 
 
@@ -610,28 +613,44 @@ def plot_scaling_results(scaling_rows: List[Dict[str, float]],
     """Line plots showing PR-AUC and training time as dataset size scales."""
     if not scaling_rows:
         return
-    scaling_rows = sorted(scaling_rows, key=lambda r: r["train_rows"])
-    sizes = [row["train_rows"] for row in scaling_rows]
-    pr_vals = [row["pr_auc"] for row in scaling_rows]
-    time_vals = [row["train_time_s"] for row in scaling_rows]
+
+    # Group rows by model so each line corresponds to a model variant
+    grouped: Dict[str, List[Dict[str, float]]] = {}
+    for row in scaling_rows:
+        model_key = row.get("model", "logistic_regression_weighted")
+        grouped.setdefault(model_key, []).append(row)
+
+    colors = ['#4C78A8', '#F58518', '#54A24B', '#E45756', '#B279A2']
 
     plt.figure(figsize=(7, 4.5))
-    plt.plot(sizes, pr_vals, marker='o', color='#4C78A8')
+    for idx, (model_key, rows) in enumerate(sorted(grouped.items())):
+        rows_sorted = sorted(rows, key=lambda r: r["train_rows"])
+        sizes = [row["train_rows"] for row in rows_sorted]
+        pr_vals = [row["pr_auc"] for row in rows_sorted]
+        color = colors[idx % len(colors)]
+        plt.plot(sizes, pr_vals, marker='o', color=color, label=human_model_name(model_key))
     plt.xlabel('Training rows')
     plt.ylabel('PR-AUC')
     plt.title('Scaling experiment: PR-AUC vs training size')
     plt.grid(True, alpha=0.3)
+    plt.legend(loc='best')
     plt.tight_layout()
     plt.savefig(pr_path, dpi=150)
     plt.close()
     print(f"Scaling PR-AUC plot saved to {pr_path}")
 
     plt.figure(figsize=(7, 4.5))
-    plt.plot(sizes, time_vals, marker='o', color='#F58518')
+    for idx, (model_key, rows) in enumerate(sorted(grouped.items())):
+        rows_sorted = sorted(rows, key=lambda r: r["train_rows"])
+        sizes = [row["train_rows"] for row in rows_sorted]
+        time_vals = [row["train_time_s"] for row in rows_sorted]
+        color = colors[idx % len(colors)]
+        plt.plot(sizes, time_vals, marker='o', color=color, label=human_model_name(model_key))
     plt.xlabel('Training rows')
     plt.ylabel('Train time (s)')
     plt.title('Scaling experiment: training time vs training size')
     plt.grid(True, alpha=0.3)
+    plt.legend(loc='best')
     plt.tight_layout()
     plt.savefig(time_path, dpi=150)
     plt.close()
@@ -1079,26 +1098,60 @@ for size in [100_000, 500_000, 1_000_000]:
         maxIter=50,
     )
     lr_scale_fitted = lr_scale_model.fit(train_sample_weighted)
-    train_time = time.time() - start_time
+    lr_train_time = time.time() - start_time
 
-    preds_scale = lr_scale_fitted.transform(valid_df).select(TARGET_COL, "probability")
-    data_scale = (preds_scale
-                  .withColumn("p1", F.when(F.size(vector_to_array("probability")) > 1,
-                                            vector_to_array("probability").getItem(1))
-                                     .otherwise(F.lit(0.0)))
-                  .select(TARGET_COL, "p1")
-                  .collect())
-    y_true_s = np.array([row[TARGET_COL] for row in data_scale])
-    y_scores_s = np.array([row["p1"] for row in data_scale])
-    pr_auc_scale = _pr_auc_from_arrays(y_true_s, y_scores_s)
+    preds_scale_lr = lr_scale_fitted.transform(valid_df).select(TARGET_COL, "probability")
+    data_scale_lr = (preds_scale_lr
+                     .withColumn("p1", F.when(F.size(vector_to_array("probability")) > 1,
+                                               vector_to_array("probability").getItem(1))
+                                        .otherwise(F.lit(0.0)))
+                     .select(TARGET_COL, "p1")
+                     .collect())
+    y_true_lr = np.array([row[TARGET_COL] for row in data_scale_lr])
+    y_scores_lr = np.array([row["p1"] for row in data_scale_lr])
+    pr_auc_lr = _pr_auc_from_arrays(y_true_lr, y_scores_lr)
 
-    result = {
+    scaling_results.append({
+        "model": "logistic_regression_weighted",
         "train_rows": actual_size,
-        "train_time_s": round(train_time, 2),
-        "pr_auc": round(pr_auc_scale, 4),
-    }
-    scaling_results.append(result)
-    print(f"  Size={actual_size:,}, Time={train_time:.2f}s, PR-AUC={pr_auc_scale:.4f}")
+        "train_time_s": round(lr_train_time, 2),
+        "pr_auc": round(pr_auc_lr, 4),
+    })
+    print(f"  [LR] Size={actual_size:,}, Time={lr_train_time:.2f}s, PR-AUC={pr_auc_lr:.4f}")
+
+    start_time = time.time()
+    rf_scale_model = RandomForestClassifier(
+        featuresCol="features",
+        labelCol=TARGET_COL,
+        weightCol="weight",
+        numTrees=80,
+        maxDepth=12,
+        maxBins=64,
+        subsamplingRate=0.8,
+        featureSubsetStrategy="sqrt",
+        seed=SEED,
+    )
+    rf_scale_fitted = rf_scale_model.fit(train_sample_weighted)
+    rf_train_time = time.time() - start_time
+
+    preds_scale_rf = rf_scale_fitted.transform(valid_df).select(TARGET_COL, "probability")
+    data_scale_rf = (preds_scale_rf
+                     .withColumn("p1", F.when(F.size(vector_to_array("probability")) > 1,
+                                               vector_to_array("probability").getItem(1))
+                                        .otherwise(F.lit(0.0)))
+                     .select(TARGET_COL, "p1")
+                     .collect())
+    y_true_rf = np.array([row[TARGET_COL] for row in data_scale_rf])
+    y_scores_rf = np.array([row["p1"] for row in data_scale_rf])
+    pr_auc_rf = _pr_auc_from_arrays(y_true_rf, y_scores_rf)
+
+    scaling_results.append({
+        "model": "random_forest_weighted",
+        "train_rows": actual_size,
+        "train_time_s": round(rf_train_time, 2),
+        "pr_auc": round(pr_auc_rf, 4),
+    })
+    print(f"  [RF] Size={actual_size:,}, Time={rf_train_time:.2f}s, PR-AUC={pr_auc_rf:.4f}")
 
     train_sample_weighted.unpersist()
 
@@ -1130,7 +1183,7 @@ write_calibration_csv(OUTPUT_DIR / "calibration_valid.csv", calib_rows)
 if scaling_results:
     write_json(OUTPUT_DIR / "scaling_results.json", scaling_results)
     with (OUTPUT_DIR / "scaling_results.csv").open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["train_rows", "train_time_s", "pr_auc"])
+        writer = csv.DictWriter(f, fieldnames=["model", "train_rows", "train_time_s", "pr_auc"])
         writer.writeheader()
         for row in scaling_results:
             writer.writerow(row)

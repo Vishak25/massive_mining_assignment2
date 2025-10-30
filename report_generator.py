@@ -174,10 +174,11 @@ def write_comprehensive_report(path: Path,
     if scaling_results:
         lines.append("### 3.5 Scaling Experiment Results\n\n")
         lines.append("Training time and PR-AUC were measured across different dataset sizes:\n\n")
-        lines.append("| Dataset Size | Training Time (s) | PR-AUC (Valid) |\n")
-        lines.append("| --- | ---: | ---: |\n")
+        lines.append("| Model | Dataset Size | Training Time (s) | PR-AUC (Valid) |\n")
+        lines.append("| --- | ---: | ---: | ---: |\n")
         for result in scaling_results:
-            lines.append(f"| {result['train_rows']:,} | {result['train_time_s']:.2f} | {result['pr_auc']:.4f} |\n")
+            model_name = human_model_name(result.get("model", "logistic_regression_weighted"))
+            lines.append(f"| {model_name} | {result['train_rows']:,} | {result['train_time_s']:.2f} | {result['pr_auc']:.4f} |\n")
         lines.append("\n")
         lines.append("This experiment demonstrates how model performance and computational cost scale with dataset size.\n\n")
 
@@ -308,4 +309,3 @@ def write_comprehensive_report(path: Path,
         lines.append("- `scaling_results.json`, `scaling_results.csv`: Scaling experiment results\n")
 
     path.write_text("".join(lines), encoding="utf-8")
-

@@ -1,4 +1,7 @@
-train_rows,train_time_s,pr_auc
-19502,5.37,0.8311
-96954,5.46,0.9151
-194439,5.39,0.9209
+model,train_rows,train_time_s,pr_auc
+logistic_regression_weighted,32473,5.4,0.8832
+random_forest_weighted,32473,5.43,0.7485
+logistic_regression_weighted,161496,5.27,0.9184
+random_forest_weighted,161496,13.62,0.751
+logistic_regression_weighted,323863,5.3,0.9227
+random_forest_weighted,323863,24.68,0.7448

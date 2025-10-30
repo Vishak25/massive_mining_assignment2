@@ -1,10 +1,10 @@
 {
   "train": {
-    "rows": 300682,
-    "positive": 62244,
-    "negative": 238438,
-    "positive_fraction": 0.20700939863377255,
-    "negative_fraction": 0.7929906013662275
+    "rows": 501090,
+    "positive": 103489,
+    "negative": 397601,
+    "positive_fraction": 0.2065277694625716,
+    "negative_fraction": 0.7934722305374284
   },
   "valid": {
     "rows": 187591,
